@@ -3,8 +3,10 @@ package event
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Listener interface defines an event listener.
@@ -13,6 +15,11 @@ type Listener interface {
 	Start(data interface{}) bool
 	Priority() int
 	Process(data interface{}) error
+}
+
+// ContextListener can be implemented by listeners that want to receive context cancellation/deadline signals.
+type ContextListener interface {
+	ProcessWithContext(ctx context.Context, data interface{}) error
 }
 
 // EmitError stores contextual information for listener failures.
@@ -28,6 +35,18 @@ func (e EmitError) Error() string {
 
 func (e EmitError) Unwrap() error {
 	return e.Err
+}
+
+// EmitResult provides event processing metrics that can be used for observability.
+type EmitResult struct {
+	EventType          string
+	TotalListeners     int
+	Started            int
+	Skipped            int
+	Successful         int
+	Failed             int
+	Duration           time.Duration
+	CancelledByContext bool
 }
 
 // Emitter defines the events emitter.
@@ -104,40 +123,164 @@ func (e *Emitter) ListenerCount(eventType string) int {
 // Emit sends an event with the given data. It keeps backward compatibility
 // with existing callers by discarding emitted errors.
 func (e *Emitter) Emit(eventType string, data interface{}) {
-	_ = e.EmitWithContext(context.Background(), eventType, data)
+	_, _ = e.EmitDetailedWithContext(context.Background(), eventType, data)
 }
 
 // EmitWithContext sends an event and aggregates processing errors.
 func (e *Emitter) EmitWithContext(ctx context.Context, eventType string, data interface{}) error {
+	_, err := e.EmitDetailedWithContext(ctx, eventType, data)
+	return err
+}
+
+// EmitDetailedWithContext sends an event and returns execution metrics plus aggregated errors.
+func (e *Emitter) EmitDetailedWithContext(ctx context.Context, eventType string, data interface{}) (EmitResult, error) {
+	start := time.Now()
+	result := EmitResult{EventType: eventType}
+
 	e.mu.RLock()
 	listeners, ok := e.listeners[eventType]
 	if !ok {
 		e.mu.RUnlock()
-		return nil
+		result.Duration = time.Since(start)
+		return result, nil
 	}
 	snapshot := append([]Listener(nil), listeners...)
 	e.mu.RUnlock()
 
+	result.TotalListeners = len(snapshot)
 	var errs []error
+
 	for _, listener := range snapshot {
 		select {
 		case <-ctx.Done():
-			errs = append(errs, ctx.Err())
-			return errors.Join(errs...)
+			result.CancelledByContext = true
+			err := ctx.Err()
+			errs = append(errs, err)
+			result.Duration = time.Since(start)
+			return result, errors.Join(errs...)
 		default:
 		}
 
 		if !listener.Start(data) {
+			result.Skipped++
 			continue
 		}
-		if err := listener.Process(data); err != nil {
+
+		result.Started++
+		if err := callListener(ctx, listener, data); err != nil {
+			result.Failed++
 			errs = append(errs, EmitError{
 				EventType:    eventType,
 				ListenerName: listener.Name(),
 				Err:          err,
 			})
+			continue
+		}
+		result.Successful++
+	}
+
+	result.Duration = time.Since(start)
+	return result, errors.Join(errs...)
+}
+
+// EmitAsyncWithContext sends an event concurrently using a worker pool.
+// It is useful for independent listeners with expensive I/O.
+func (e *Emitter) EmitAsyncWithContext(ctx context.Context, eventType string, data interface{}, workers int) (EmitResult, error) {
+	start := time.Now()
+	result := EmitResult{EventType: eventType}
+
+	e.mu.RLock()
+	listeners, ok := e.listeners[eventType]
+	if !ok {
+		e.mu.RUnlock()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	snapshot := append([]Listener(nil), listeners...)
+	e.mu.RUnlock()
+
+	result.TotalListeners = len(snapshot)
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	if workers > len(snapshot) {
+		workers = len(snapshot)
+	}
+	if workers == 0 {
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+
+	jobs := make(chan Listener)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+
+	worker := func() {
+		defer wg.Done()
+		for listener := range jobs {
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				result.CancelledByContext = true
+				mu.Unlock()
+				return
+			default:
+			}
+
+			if !listener.Start(data) {
+				mu.Lock()
+				result.Skipped++
+				mu.Unlock()
+				continue
+			}
+
+			err := callListener(ctx, listener, data)
+			mu.Lock()
+			result.Started++
+			if err != nil {
+				result.Failed++
+				errs = append(errs, EmitError{
+					EventType:    eventType,
+					ListenerName: listener.Name(),
+					Err:          err,
+				})
+			} else {
+				result.Successful++
+			}
+			mu.Unlock()
 		}
 	}
 
-	return errors.Join(errs...)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
+	for _, listener := range snapshot {
+		select {
+		case <-ctx.Done():
+			result.CancelledByContext = true
+			break
+		case jobs <- listener:
+		}
+		if result.CancelledByContext {
+			break
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	if result.CancelledByContext {
+		errs = append(errs, ctx.Err())
+	}
+	result.Duration = time.Since(start)
+	return result, errors.Join(errs...)
+}
+
+func callListener(ctx context.Context, listener Listener, data interface{}) error {
+	if contextual, ok := listener.(ContextListener); ok {
+		return contextual.ProcessWithContext(ctx, data)
+	}
+	return listener.Process(data)
 }
