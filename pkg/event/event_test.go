@@ -5,7 +5,9 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 var (
@@ -28,6 +30,16 @@ func (l testListener) Process(data interface{}) error {
 	if l.callLog != nil {
 		*l.callLog = append(*l.callLog, l.priority)
 	}
+	return l.err
+}
+
+type contextAwareListener struct {
+	testListener
+	ctxHit *atomic.Bool
+}
+
+func (l contextAwareListener) ProcessWithContext(ctx context.Context, data interface{}) error {
+	l.ctxHit.Store(true)
 	return l.err
 }
 
@@ -67,6 +79,73 @@ func TestEmitWithContextCollectsErrors(t *testing.T) {
 	}
 }
 
+func TestEmitDetailedWithContextResult(t *testing.T) {
+	e := NewEmitter()
+	e.AddListeners(
+		testListener{name: "evt", priority: 0, startOK: false},
+		testListener{name: "evt", priority: 1, startOK: true},
+		testListener{name: "evt", priority: 2, startOK: true, err: errBoom},
+	)
+
+	result, err := e.EmitDetailedWithContext(context.Background(), "evt", nil)
+	if err == nil || !errors.Is(err, errBoom) {
+		t.Fatalf("expected result error to include boom, got %v", err)
+	}
+	if result.TotalListeners != 3 || result.Skipped != 1 || result.Started != 2 || result.Successful != 1 || result.Failed != 1 {
+		t.Fatalf("unexpected result counters: %+v", result)
+	}
+	if result.Duration <= 0 {
+		t.Fatalf("expected positive duration, got %s", result.Duration)
+	}
+}
+
+func TestEmitDetailedWithContextUsesContextAwareListener(t *testing.T) {
+	e := NewEmitter()
+	hit := &atomic.Bool{}
+	e.AddListener(contextAwareListener{testListener: testListener{name: "evt", startOK: true}, ctxHit: hit})
+
+	_, err := e.EmitDetailedWithContext(context.Background(), "evt", nil)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if !hit.Load() {
+		t.Fatal("expected ProcessWithContext to be used")
+	}
+}
+
+func TestEmitAsyncWithContext(t *testing.T) {
+	e := NewEmitter()
+	e.AddListeners(
+		testListener{name: "evt", priority: 0, startOK: true},
+		testListener{name: "evt", priority: 1, startOK: true, err: errBoom},
+		testListener{name: "evt", priority: 2, startOK: false},
+	)
+
+	result, err := e.EmitAsyncWithContext(context.Background(), "evt", nil, 2)
+	if err == nil || !errors.Is(err, errBoom) {
+		t.Fatalf("expected async error to include boom, got %v", err)
+	}
+	if result.TotalListeners != 3 || result.Started != 2 || result.Skipped != 1 || result.Successful != 1 || result.Failed != 1 {
+		t.Fatalf("unexpected async result counters: %+v", result)
+	}
+}
+
+func TestEmitAsyncWithContextCancelled(t *testing.T) {
+	e := NewEmitter()
+	e.AddListener(testListener{name: "evt", priority: 0, startOK: true})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := e.EmitAsyncWithContext(ctx, "evt", nil, 1)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+	if !result.CancelledByContext {
+		t.Fatalf("expected cancelled result, got %+v", result)
+	}
+}
+
 func TestRemoveListener(t *testing.T) {
 	e := NewEmitter()
 	e.AddListeners(
@@ -80,5 +159,21 @@ func TestRemoveListener(t *testing.T) {
 	}
 	if got := e.ListenerCount("evt"); got != 1 {
 		t.Fatalf("expected 1 listener after removal, got %d", got)
+	}
+}
+
+func TestEmitWithContextStopsOnCancellation(t *testing.T) {
+	e := NewEmitter()
+	e.AddListener(testListener{name: "evt", priority: 0, startOK: true, err: nil})
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
+	defer cancel()
+
+	result, err := e.EmitDetailedWithContext(ctx, "evt", nil)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	if !result.CancelledByContext {
+		t.Fatalf("expected cancellation flag, got %+v", result)
 	}
 }
